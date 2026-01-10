@@ -1,1 +1,358 @@
+library(dplyr)
+library(ggplot2)
+library(Seurat)
+library(AUCell)
+library(GSEABase)
+library(randomForest)
+library(ggridges)
+library(gg3D)
+library(cluster)
+rm(list = ls())
+gc()
 
+# 设置更大的内存限制
+options(future.globals.maxSize = 120 * 1024^3)
+setwd("E:/R/Spinal core/GSE306676")
+
+# 1. 数据加载
+sobj <- readRDS("E:/R/Spinal core/GSE306676/GSE306676_all_integrated_annotated_final.rds")
+
+# 设置基础图形保存路径
+save_path <- "E:/R/Spinal core/GSE306676/graph"
+
+# 创建通用目录（QC、PCA、Clustering、GeneSets）
+qc_path <- file.path(save_path, "QC")
+pca_path <- file.path(save_path, "PCA")
+clustering_path <- file.path(save_path, "Clustering")
+geneset_path <- file.path(save_path, "GeneSets")
+dir.create(qc_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(pca_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(clustering_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(geneset_path, showWarnings = FALSE, recursive = TRUE)
+
+# 分类结果统一放在 Classification 目录下，按类型分目录
+class_base_path <- file.path(save_path, "Classification")
+dir.create(class_base_path, showWarnings = FALSE, recursive = TRUE)
+
+save_plot <- function(plot, path_base, width, height) {
+  ggsave(paste0(path_base, ".pdf"), plot, width = width, height = height)
+  ggsave(paste0(path_base, ".tiff"), plot, width = width, height = height, dpi = 300, device = "tiff")
+}
+
+# 2. 质控
+sobj[["percent.mt"]] <- PercentageFeatureSet(sobj, pattern = "^mt-")
+sobj_qc <- subset(sobj, subset = nFeature_RNA > 300 & nFeature_RNA < 6000 & percent.mt < 10)
+sobj <- sobj_qc
+p1 <- VlnPlot(sobj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0.1)
+save_plot(p1, file.path(qc_path, "QC_Metrics_VlnPlot_AfterFiltering"), width = 15, height = 5)
+
+# 3. 选取样本并提取数据
+selected <- sobj$stage %in% c("ctl", "sod.early", "sod.end", "sod.mid")
+sobj_subset <- sobj[, selected]
+expr_matrix <- GetAssayData(sobj_subset, assay = "RNA", layer = "data") # 基因 × 细胞
+
+# 4. 高变基因筛选
+sobj_subset <- FindVariableFeatures(sobj_subset, selection.method = "vst", nfeatures = 2000)
+hvgs <- VariableFeatures(sobj_subset)
+cat("前30个高变基因：\n")
+print(head(hvgs, 30))
+
+# 5. 提取高变基因表达矩阵 & 基因PCA（正确方向）
+expr_hvg <- expr_matrix[hvgs, ]
+expr_hvg_t <- t(expr_hvg) # 细胞 × 高变基因
+pca_genes <- prcomp(expr_hvg_t, center = TRUE, scale. = TRUE)
+gene_pca_coords <- as.data.frame(pca_genes$rotation)
+gene_pca_coords$gene <- rownames(gene_pca_coords)
+
+# PCA可视化
+p_pca <- ggplot(gene_pca_coords, aes(x = PC1, y = PC2)) +
+  geom_point(size = 0.5, alpha = 0.7, color = "gray") +
+  labs(title = "Gene PCA (2000 HVGs)", x = "PC1", y = "PC2") +
+  theme_minimal()
+save_plot(p_pca, file.path(pca_path, "Gene_PCA_PC1_vs_PC2"), width = 10, height = 8)
+
+# 6. K-means聚类（K=15）
+set.seed(123)
+chosen_k <- 15
+kmeans_result <- kmeans(gene_pca_coords[, 1:20], centers = chosen_k, nstart = 25)
+gene_pca_coords$cluster <- factor(kmeans_result$cluster, levels = 1:chosen_k)
+p_cluster <- ggplot(gene_pca_coords, aes(x = PC1, y = PC2, color = factor(cluster))) +
+  geom_point(size = 0.5, alpha = 0.7) +
+  labs(title = "Gene Modules (K=15)", color = "Module") +
+  theme_minimal()
+save_plot(p_cluster, file.path(clustering_path, "Gene_PCA_Clustering_K15"), width = 10, height = 8)
+
+# 7. 构建基因集
+cluster_levels <- levels(gene_pca_coords$cluster)
+genesets <- split(gene_pca_coords$gene, gene_pca_coords$cluster)
+genesets <- genesets[cluster_levels]
+names(genesets) <- paste0("GeneSet", seq_len(chosen_k))
+saveRDS(genesets, file.path(geneset_path, "Correct_GeneSets_K15.rds"))
+
+# 保存GMT
+gmt_filename <- file.path(geneset_path, "Correct_GeneSets_K15.gmt")
+con <- file(gmt_filename, "w")
+for (i in names(genesets)) {
+  writeLines(paste(c(i, "description", genesets[[i]]), collapse = "\t"), con)
+}
+close(con)
+
+# 8. AUCell
+rankings <- AUCell_buildRankings(expr_matrix)
+auc_score <- AUCell_calcAUC(genesets, rankings, verbose = TRUE)
+auc_df <- as.data.frame(t(getAUC(auc_score)))
+auc_df$type <- sobj_subset$stage
+auc_df$type <- factor(auc_df$type, levels = c("ctl", "sod.early", "sod.end", "sod.mid"))
+
+# 9. 四种分类 - 分别设置子目录
+auc_columns <- paste0("GeneSet", 1:chosen_k)
+
+# 创建四类目录
+binary_path <- file.path(class_base_path, "Binary_ctl_vs_sod")
+multi4_path <- file.path(class_base_path, "Multiclass_4stages")
+disease_only_path <- file.path(class_base_path, "Multiclass_DiseaseOnly")
+pairwise_base <- file.path(class_base_path, "Pairwise_ctl_vs_each")
+paired_early_end_path <- file.path(class_base_path, "Pairwise_sod.early_vs_sod.end")
+dir.create(binary_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(multi4_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(disease_only_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(pairwise_base, showWarnings = FALSE, recursive = TRUE)
+dir.create(paired_early_end_path, showWarnings = FALSE, recursive = TRUE)
+
+# 辅助函数：创建子分类的内部子目录
+create_sub_dirs <- function(base_dir) {
+  dir.create(file.path(base_dir, "Importance"), showWarnings = FALSE)
+  dir.create(file.path(base_dir, "Boxplots"), showWarnings = FALSE)
+  dir.create(file.path(base_dir, "Ridgelines"), showWarnings = FALSE)
+  dir.create(file.path(base_dir, "3D_Plots"), showWarnings = FALSE)
+}
+create_sub_dirs(binary_path)
+create_sub_dirs(multi4_path)
+create_sub_dirs(disease_only_path)
+create_sub_dirs(paired_early_end_path)
+
+# 辅助函数：可视化重要性、箱线、岭线、3D（通用函数，按目录保存）
+visualize_results <- function(rf_model, balanced_data, label_col, base_dir, top_n = 4) {
+  # 重要性图
+  imp <- importance(rf_model, type = 2)
+  imp_df <- data.frame(Variable = rownames(imp), Importance = imp[, 1])
+  p_imp <- ggplot(imp_df, aes(x = Variable, y = Importance, fill = Variable)) +
+    geom_bar(stat = "identity") +
+    geom_abline(intercept = 30, slope = 0, color = "red") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "none") +
+    labs(title = "RF Feature Importance", x = "Features", y = "Importance")
+  save_plot(p_imp, file.path(base_dir, "Importance", "rf_importance"), width = 7, height = 5)
+
+  # 选 top_n 模块
+  top_modules <- imp_df[order(imp_df$Importance, decreasing = TRUE), "Variable"][1:top_n]
+
+  # 箱线图 & 岭线图
+  for (mod in top_modules) {
+    dat <- balanced_data[, c(mod, label_col)]
+    colnames(dat) <- c("score", "group")
+
+    # 箱线图
+    p_box <- ggplot(dat, aes(x = group, y = score, fill = group)) +
+      geom_boxplot() + theme_bw() + theme(legend.position = "none") +
+      labs(title = paste("Boxplot:", mod), y = "AUCell Score")
+    save_plot(p_box, file.path(base_dir, "Boxplots", paste0("boxplot_", mod)), width = 5, height = 5)
+
+    # 岭线图
+    p_ridge <- ggplot(dat, aes(x = score, y = group, fill = group)) +
+      geom_density_ridges(alpha = 0.5) + theme_bw() + theme(legend.position = "none") +
+      labs(title = paste("Ridgeline:", mod), x = "AUCell Score")
+    save_plot(p_ridge, file.path(base_dir, "Ridgelines", paste0("ridgeline_", mod)), width = 5, height = 3)
+  }
+
+  # 3D图（用 top 3 模块）
+  if (length(top_modules) >= 3) {
+    dat_3d <- balanced_data[, c(top_modules[1:3], label_col)]
+    colnames(dat_3d)[1:3] <- top_modules[1:3]
+    colnames(dat_3d)[4] <- "group"
+
+    theta <- 0
+    phi <- 20
+    p_3d <- ggplot(dat_3d, aes(
+      x = .data[[top_modules[1]]],
+      y = .data[[top_modules[2]]],
+      z = .data[[top_modules[3]]],
+      color = group
+    )) +
+      axes_3D(theta = theta, phi = phi) +
+      stat_3D(theta = theta, phi = phi, alpha = 0.8, size = 0.5) +
+      labs_3D(
+        theta = theta,
+        phi = phi,
+        labs = top_modules[1:3],
+        hjust = c(1, 0, 0),
+        vjust = c(1.5, 1, -0.2)
+      ) +
+      theme_void()
+    save_plot(p_3d, file.path(base_dir, "3D_Plots", "3d_scatter"), width = 5, height = 5)
+  }
+}
+
+# --------------------------------------------------
+
+# 1. 二分类：ctl vs sod
+
+data <- auc_df
+data$type_binary <- ifelse(data$type == "ctl", "ctl", "sod")
+data$type_binary <- factor(data$type_binary, levels = c("ctl", "sod"))
+model_data_binary <- data[, c(auc_columns, "type_binary")]
+model_data_binary <- model_data_binary[complete.cases(model_data_binary), ]
+class_counts_binary <- table(model_data_binary$type_binary)
+min_class_size_binary <- min(class_counts_binary)
+balanced_samples_binary <- list()
+for (class_name in names(class_counts_binary)) {
+  class_data <- model_data_binary[model_data_binary$type_binary == class_name, ]
+  balanced_samples_binary[[class_name]] <- class_data[sample(nrow(class_data), min_class_size_binary), ]
+}
+balanced_data_binary <- do.call(rbind, balanced_samples_binary)
+set.seed(123)
+rf_binary <- randomForest(type_binary ~ ., data = balanced_data_binary, importance = TRUE, ntree = 1000)
+
+# 评估
+print("=== 二分类模型 (ctl vs sod) - 平衡后 ===")
+conf_matrix_binary <- rf_binary$confusion
+total_correct_binary <- sum(diag(conf_matrix_binary[-nrow(conf_matrix_binary), ]))
+total_samples_binary <- sum(conf_matrix_binary[-nrow(conf_matrix_binary), -ncol(conf_matrix_binary)])
+print(paste("总体准确率:", round(total_correct_binary / total_samples_binary, 4)))
+print(conf_matrix_binary)
+
+# 可视化 & 保存
+visualize_results(rf_binary, balanced_data_binary, "type_binary", binary_path)
+
+# --------------------------------------------------
+
+# 2. 多分类：ctl vs sod.early vs sod.end vs sod.mid
+
+data$type_multi <- data$type
+model_data_multi <- data[, c(auc_columns, "type_multi")]
+model_data_multi <- model_data_multi[complete.cases(model_data_multi), ]
+class_counts_multi <- table(model_data_multi$type_multi)
+min_class_size_multi <- min(class_counts_multi)
+balanced_samples_multi <- list()
+for (class_name in names(class_counts_multi)) {
+  class_data <- model_data_multi[model_data_multi$type_multi == class_name, ]
+  balanced_samples_multi[[class_name]] <- class_data[sample(nrow(class_data), min_class_size_multi), ]
+}
+balanced_data_multi <- do.call(rbind, balanced_samples_multi)
+set.seed(123)
+rf_multi <- randomForest(type_multi ~ ., data = balanced_data_multi, importance = TRUE, ntree = 1000)
+
+# 评估
+print("=== 多分类模型 (4 stages) - 平衡后 ===")
+conf_matrix_multi <- rf_multi$confusion
+total_correct_multi <- sum(diag(conf_matrix_multi[-nrow(conf_matrix_multi), ]))
+total_samples_multi <- sum(conf_matrix_multi[-nrow(conf_matrix_multi), -ncol(conf_matrix_multi)])
+print(paste("总体准确率:", round(total_correct_multi / total_samples_multi, 4)))
+print(conf_matrix_multi)
+
+# 可视化 & 保存
+visualize_results(rf_multi, balanced_data_multi, "type_multi", multi4_path)
+
+# --------------------------------------------------
+
+# 3. 仅疾病阶段多分类：sod.early vs sod.end vs sod.mid
+
+disease_data <- data[data$type %in% c("sod.early", "sod.end", "sod.mid"), ]
+disease_data$type_disease <- factor(disease_data$type, levels = c("sod.early", "sod.end", "sod.mid"))
+model_data_disease <- disease_data[, c(auc_columns, "type_disease")]
+model_data_disease <- model_data_disease[complete.cases(model_data_disease), ]
+class_counts_disease <- table(model_data_disease$type_disease)
+min_class_size_disease <- min(class_counts_disease)
+balanced_samples_disease <- list()
+for (class_name in names(class_counts_disease)) {
+  class_data <- model_data_disease[model_data_disease$type_disease == class_name, ]
+  balanced_samples_disease[[class_name]] <- class_data[sample(nrow(class_data), min_class_size_disease), ]
+}
+balanced_data_disease <- do.call(rbind, balanced_samples_disease)
+set.seed(123)
+rf_disease <- randomForest(type_disease ~ ., data = balanced_data_disease, importance = TRUE, ntree = 1000)
+
+# 评估
+print("=== 仅疾病阶段多分类模型 - 平衡后 ===")
+conf_matrix_disease <- rf_disease$confusion
+total_correct_disease <- sum(diag(conf_matrix_disease[-nrow(conf_matrix_disease), ]))
+total_samples_disease <- sum(conf_matrix_disease[-nrow(conf_matrix_disease), -ncol(conf_matrix_disease)])
+print(paste("总体准确率:", round(total_correct_disease / total_samples_disease, 4)))
+print(conf_matrix_disease)
+
+# 可视化 & 保存
+visualize_results(rf_disease, balanced_data_disease, "type_disease", disease_only_path)
+
+# --------------------------------------------------
+
+# 4. 两两比较：ctl vs each disease stage
+
+stages <- c("sod.early", "sod.mid", "sod.end")
+for (stage in stages) {
+  pairwise_dir <- file.path(pairwise_base, paste0("ctl_vs_", stage))
+  dir.create(pairwise_dir, showWarnings = FALSE, recursive = TRUE)
+  create_sub_dirs(pairwise_dir)
+
+  pairwise_data <- data[data$type %in% c("ctl", stage), ]
+  pairwise_data$type_binary <- factor(pairwise_data$type, levels = c("ctl", stage))
+  model_data_stage <- pairwise_data[, c(auc_columns, "type_binary")]
+  model_data_stage <- model_data_stage[complete.cases(model_data_stage), ]
+  class_counts_stage <- table(model_data_stage$type_binary)
+  min_class_size_stage <- min(class_counts_stage)
+  balanced_samples_stage <- list()
+  for (class_name in names(class_counts_stage)) {
+    class_data <- model_data_stage[model_data_stage$type_binary == class_name, ]
+    balanced_samples_stage[[class_name]] <- class_data[sample(nrow(class_data), min_class_size_stage), ]
+  }
+  balanced_data_stage <- do.call(rbind, balanced_samples_stage)
+  set.seed(123)
+  rf_stage <- randomForest(type_binary ~ ., data = balanced_data_stage, importance = TRUE, ntree = 1000)
+
+  # 评估
+  print(paste("=== ctl vs", stage, "- 平衡后 ==="))
+  conf_matrix_stage <- rf_stage$confusion
+  total_correct_stage <- sum(diag(conf_matrix_stage[-nrow(conf_matrix_stage), ]))
+  total_samples_stage <- sum(conf_matrix_stage[-nrow(conf_matrix_stage), -ncol(conf_matrix_stage)])
+  print(paste("准确率:", round(total_correct_stage / total_samples_stage, 4)))
+  print(conf_matrix_stage)
+
+  # 可视化 & 保存
+  visualize_results(rf_stage, balanced_data_stage, "type_binary", pairwise_dir)
+}
+
+# 5. 追加分类：sod.early vs sod.end
+
+early_end_data <- data[data$type %in% c("sod.early", "sod.end"), ]
+early_end_data$type_binary <- factor(early_end_data$type, levels = c("sod.early", "sod.end"))
+model_data_early_end <- early_end_data[, c(auc_columns, "type_binary")]
+model_data_early_end <- model_data_early_end[complete.cases(model_data_early_end), ]
+class_counts_early_end <- table(model_data_early_end$type_binary)
+min_class_size_early_end <- min(class_counts_early_end)
+balanced_samples_early_end <- list()
+for (class_name in names(class_counts_early_end)) {
+  class_data <- model_data_early_end[model_data_early_end$type_binary == class_name, ]
+  balanced_samples_early_end[[class_name]] <- class_data[sample(nrow(class_data), min_class_size_early_end), ]
+}
+balanced_data_early_end <- do.call(rbind, balanced_samples_early_end)
+set.seed(123)
+rf_early_end <- randomForest(type_binary ~ ., data = balanced_data_early_end, importance = TRUE, ntree = 1000)
+
+# 评估
+print("=== sod.early vs sod.end - 平衡后 ===")
+conf_matrix_early_end <- rf_early_end$confusion
+total_correct_early_end <- sum(diag(conf_matrix_early_end[-nrow(conf_matrix_early_end), ]))
+total_samples_early_end <- sum(conf_matrix_early_end[-nrow(conf_matrix_early_end), -ncol(conf_matrix_early_end)])
+print(paste("准确率:", round(total_correct_early_end / total_samples_early_end, 4)))
+print(conf_matrix_early_end)
+
+# 可视化 & 保存
+visualize_results(rf_early_end, balanced_data_early_end, "type_binary", paired_early_end_path)
+
+cat("所有分类结果已分别保存到对应子目录下。\n")
+cat("请检查:", class_base_path, "\n")
+
+# 方法1：最简单 - 直接打印每个 GeneSet 的基因数目
+cat("每个 GeneSet 中的基因数目：\n\n")
+for (i in seq_along(genesets)) {
+  cat(sprintf("%s: %d 个基因\n", names(genesets)[i], length(genesets[[i]])))
+}
