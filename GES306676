@@ -39,6 +39,7 @@ save_plot <- function(plot, path_base, width, height) {
   ggsave(paste0(path_base, ".tiff"), plot, width = width, height = height, dpi = 300, device = "tiff")
 }
 
+# [新增] 分类模型汇总表工具函数：统计类别数、min_class_size、总训练细胞数与准确率
 add_summary_row <- function(summary_df, model_name, class_counts, accuracy) {
   min_class_size <- min(class_counts)
   class_count <- length(class_counts)
@@ -57,6 +58,7 @@ add_summary_row <- function(summary_df, model_name, class_counts, accuracy) {
   summary_df
 }
 
+# [新增] 分类模型汇总表初始化
 model_summary <- data.frame(
   model = character(0),
   class_count = integer(0),
@@ -250,6 +252,7 @@ print(conf_matrix_binary)
 
 # 可视化 & 保存
 visualize_results(rf_binary, balanced_data_binary, "type_binary", binary_path)
+# [新增] 汇总表追加：Binary_ctl_vs_sod
 model_summary <- add_summary_row(
   model_summary,
   "Binary_ctl_vs_sod",
@@ -285,6 +288,7 @@ print(conf_matrix_multi)
 
 # 可视化 & 保存
 visualize_results(rf_multi, balanced_data_multi, "type_multi", multi4_path)
+# [新增] 汇总表追加：Multiclass_4stages
 model_summary <- add_summary_row(
   model_summary,
   "Multiclass_4stages",
@@ -321,6 +325,7 @@ print(conf_matrix_disease)
 
 # 可视化 & 保存
 visualize_results(rf_disease, balanced_data_disease, "type_disease", disease_only_path)
+# [新增] 汇总表追加：Multiclass_DiseaseOnly
 model_summary <- add_summary_row(
   model_summary,
   "Multiclass_DiseaseOnly",
@@ -358,17 +363,18 @@ for (stage in stages) {
   conf_matrix_stage <- rf_stage$confusion
   total_correct_stage <- sum(diag(conf_matrix_stage[-nrow(conf_matrix_stage), ]))
   total_samples_stage <- sum(conf_matrix_stage[-nrow(conf_matrix_stage), -ncol(conf_matrix_stage)])
-print(paste("准确率:", round(total_correct_stage / total_samples_stage, 4)))
-print(conf_matrix_stage)
+  print(paste("准确率:", round(total_correct_stage / total_samples_stage, 4)))
+  print(conf_matrix_stage)
 
-# 可视化 & 保存
-visualize_results(rf_stage, balanced_data_stage, "type_binary", pairwise_dir)
-model_summary <- add_summary_row(
-  model_summary,
-  paste0("Pairwise_ctl_vs_", stage),
-  class_counts_stage,
-  total_correct_stage / total_samples_stage
-)
+  # 可视化 & 保存
+  visualize_results(rf_stage, balanced_data_stage, "type_binary", pairwise_dir)
+  # [新增] 汇总表追加：Pairwise_ctl_vs_*
+  model_summary <- add_summary_row(
+    model_summary,
+    paste0("Pairwise_ctl_vs_", stage),
+    class_counts_stage,
+    total_correct_stage / total_samples_stage
+  )
 }
 
 # 5. 追加分类：sod.early vs sod.end
@@ -398,6 +404,7 @@ print(conf_matrix_early_end)
 
 # 可视化 & 保存
 visualize_results(rf_early_end, balanced_data_early_end, "type_binary", paired_early_end_path)
+# [新增] 汇总表追加：Pairwise_sod.early_vs_sod.end
 model_summary <- add_summary_row(
   model_summary,
   "Pairwise_sod.early_vs_sod.end",
@@ -408,6 +415,7 @@ model_summary <- add_summary_row(
 cat("所有分类结果已分别保存到对应子目录下。\n")
 cat("请检查:", class_base_path, "\n")
 
+# [新增] 输出分类模型汇总表
 cat("分类模型汇总表（类别数 / min_class_size / 总训练细胞数 / 准确率）：\n")
 print(model_summary)
 
