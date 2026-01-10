@@ -161,10 +161,11 @@ create_sub_dirs(disease_only_path)
 create_sub_dirs(paired_early_end_path)
 
 # 辅助函数：可视化重要性、箱线、岭线、3D（通用函数，按目录保存）
-visualize_results <- function(rf_model, balanced_data, label_col, base_dir, top_n = 4) {
+visualize_results <- function(rf_model, balanced_data, label_col, base_dir, feature_levels, top_n = 4) {
   # 重要性图
   imp <- importance(rf_model, type = 2)
   imp_df <- data.frame(Variable = rownames(imp), Importance = imp[, 1])
+  imp_df$Variable <- factor(imp_df$Variable, levels = feature_levels)
   p_imp <- ggplot(imp_df, aes(x = Variable, y = Importance, fill = Variable)) +
     geom_bar(stat = "identity") +
     geom_abline(intercept = 30, slope = 0, color = "red") +
@@ -251,7 +252,7 @@ print(paste("总体准确率:", round(total_correct_binary / total_samples_binar
 print(conf_matrix_binary)
 
 # 可视化 & 保存
-visualize_results(rf_binary, balanced_data_binary, "type_binary", binary_path)
+visualize_results(rf_binary, balanced_data_binary, "type_binary", binary_path, auc_columns)
 # [新增] 汇总表追加：Binary_ctl_vs_sod
 model_summary <- add_summary_row(
   model_summary,
@@ -287,7 +288,7 @@ print(paste("总体准确率:", round(total_correct_multi / total_samples_multi,
 print(conf_matrix_multi)
 
 # 可视化 & 保存
-visualize_results(rf_multi, balanced_data_multi, "type_multi", multi4_path)
+visualize_results(rf_multi, balanced_data_multi, "type_multi", multi4_path, auc_columns)
 # [新增] 汇总表追加：Multiclass_4stages
 model_summary <- add_summary_row(
   model_summary,
@@ -324,7 +325,7 @@ print(paste("总体准确率:", round(total_correct_disease / total_samples_dise
 print(conf_matrix_disease)
 
 # 可视化 & 保存
-visualize_results(rf_disease, balanced_data_disease, "type_disease", disease_only_path)
+visualize_results(rf_disease, balanced_data_disease, "type_disease", disease_only_path, auc_columns)
 # [新增] 汇总表追加：Multiclass_DiseaseOnly
 model_summary <- add_summary_row(
   model_summary,
@@ -367,7 +368,7 @@ for (stage in stages) {
   print(conf_matrix_stage)
 
   # 可视化 & 保存
-  visualize_results(rf_stage, balanced_data_stage, "type_binary", pairwise_dir)
+  visualize_results(rf_stage, balanced_data_stage, "type_binary", pairwise_dir, auc_columns)
   # [新增] 汇总表追加：Pairwise_ctl_vs_*
   model_summary <- add_summary_row(
     model_summary,
@@ -403,7 +404,7 @@ print(paste("准确率:", round(total_correct_early_end / total_samples_early_en
 print(conf_matrix_early_end)
 
 # 可视化 & 保存
-visualize_results(rf_early_end, balanced_data_early_end, "type_binary", paired_early_end_path)
+visualize_results(rf_early_end, balanced_data_early_end, "type_binary", paired_early_end_path, auc_columns)
 # [新增] 汇总表追加：Pairwise_sod.early_vs_sod.end
 model_summary <- add_summary_row(
   model_summary,
@@ -416,6 +417,7 @@ cat("所有分类结果已分别保存到对应子目录下。\n")
 cat("请检查:", class_base_path, "\n")
 
 # [新增] 输出分类模型汇总表
+model_summary <- model_summary[order(model_summary$model), ]
 cat("分类模型汇总表（类别数 / min_class_size / 总训练细胞数 / 准确率）：\n")
 print(model_summary)
 write.csv(
