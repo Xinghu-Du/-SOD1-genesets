@@ -418,6 +418,11 @@ cat("请检查:", class_base_path, "\n")
 # [新增] 输出分类模型汇总表
 cat("分类模型汇总表（类别数 / min_class_size / 总训练细胞数 / 准确率）：\n")
 print(model_summary)
+write.csv(
+  model_summary,
+  file.path(class_base_path, "model_summary.csv"),
+  row.names = FALSE
+)
 
 # 方法1：最简单 - 直接打印每个 GeneSet 的基因数目
 cat("每个 GeneSet 中的基因数目：\n\n")
