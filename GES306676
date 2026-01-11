@@ -176,6 +176,7 @@ visualize_results <- function(rf_model, balanced_data, label_col, base_dir, feat
 
   # 选 top_n 模块
   top_modules <- imp_df[order(imp_df$Importance, decreasing = TRUE), "Variable"][1:top_n]
+  top_modules <- as.character(top_modules)
 
   # 箱线图 & 岭线图
   for (mod in top_modules) {
